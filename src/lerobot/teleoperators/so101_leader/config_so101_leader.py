@@ -26,3 +26,14 @@ class SO101LeaderConfig(TeleoperatorConfig):
     port: str
 
     use_degrees: bool = False
+    
+    # 圧力センサの設定
+    pressure_sensor_enabled: bool = True
+    pressure_sensor_port: str = "/dev/cu.usbmodem21101"
+    pressure_sensor_baudrate: int = 9600
+    
+    # 圧力閾値 [N] (ニュートン)
+    pressure_threshold: float = 1.0  # 例: 2N
+    
+    # グリッパ制限時のトルク (サーボで抵抗を生成)
+    gripper_hold_torque: int = 100  # 0-1000の範囲

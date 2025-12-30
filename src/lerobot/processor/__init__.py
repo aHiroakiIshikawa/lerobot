@@ -50,6 +50,10 @@ from .hil_processor import (
     TimeLimitProcessorStep,
 )
 from .joint_observations_processor import JointVelocityProcessorStep, MotorCurrentProcessorStep
+from .pressure_observations_processor import (
+    OBS_STATE_WITH_PRESSURE,
+    PressureSensorProcessorStep,
+)
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
@@ -102,6 +106,9 @@ __all__ = [
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
     "MotorCurrentProcessorStep",
+    "OBS_STATE_WITH_PRESSURE",
+    "PressureSensorProcessorStep",
+    "create_pressure_processor",
     "NormalizerProcessorStep",
     "Numpy2TorchActionProcessorStep",
     "ObservationProcessorStep",
