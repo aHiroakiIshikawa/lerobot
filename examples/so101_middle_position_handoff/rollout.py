@@ -51,6 +51,9 @@ import platform
 import time
 from dataclasses import dataclass, field
 
+from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import (

@@ -81,6 +81,9 @@ def test_cli_policy_path_loads_before_hardware(monkeypatch) -> None:
             "so101-handoff",
             "--robot.type=so101_follower",
             "--robot.port=/dev/null",
+            "--robot.cameras={top: {type: opencv, index_or_path: 0, width: 640, "
+            "height: 480, fps: 30, fourcc: MJPG}, wrist: {type: opencv, "
+            "index_or_path: 1, width: 640, height: 480, fps: 30, fourcc: MJPG}}",
             "--policy.path=test/policy",
             '--middle_positions={"shoulder_pan.pos": 0.0}',
         ],
@@ -109,6 +112,10 @@ def test_cli_policy_path_loads_before_hardware(monkeypatch) -> None:
     assert cfg.policy is fake_policy
     assert cfg.policy.pretrained_path == "test/policy"
     assert cfg.middle_positions == {"shoulder_pan.pos": 0.0}
+    assert set(cfg.robot.cameras) == {"top", "wrist"}
+    assert cfg.robot.cameras["top"].index_or_path == 0
+    assert cfg.robot.cameras["wrist"].index_or_path == 1
+    assert cfg.robot.cameras["top"].fourcc == "MJPG"
     assert cfg.robot.max_relative_target == cfg.max_joint_step_deg
     fake_strategy.setup.assert_called_once_with(fake_context)
     fake_strategy.run.assert_called_once_with(fake_context)
