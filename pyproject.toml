@@ -149,6 +149,7 @@ pygame-dep = ["pygame>=2.5.1,<2.7.0"]
 # fails at load with "liburdfdom_sensor.so.4.0: cannot open shared object file" (see #3755).
 # There is no cmeel-urdfdom 5.x; <5 selects the 4.x ABI the placo/pin wheels are built against.
 placo-dep = ["placo>=0.9.6,<0.9.16", "cmeel-urdfdom>=4,<5", "cmeel-tinyxml2<11"]
+ikpy-dep = ["ikpy>=4.0.0,<5.0.0", "defusedxml>=0.7.1,<1.0.0"]
 transformers-dep = ["transformers>=5.4.0,<5.6.0"]
 grpcio-dep = ["grpcio>=1.73.1,<2.0.0", "protobuf>=6.31.1,<8.0.0"]
 accelerate-dep = ["accelerate>=1.14.0,<2.0.0"]
@@ -196,7 +197,12 @@ reachy2 = [
 # Seeed Studio reBot B601-DM follower (motorbridge / CAN) + StarArm102 / reBot Arm 102
 # leader (motorbridge-smart-servo / FashionStar UART servos).
 rebot = ["lerobot[motorbridge-dep]", "lerobot[motorbridge-smart-servo-dep]"]
-kinematics = ["lerobot[placo-dep]"]
+# Placo/Pinocchio publish no Windows wheels. IKPy is a pure-Python fallback used
+# by the SO-101 keyboard EEF handoff example on native Windows.
+kinematics = [
+    "lerobot[placo-dep] ; sys_platform != 'win32'",
+    "lerobot[ikpy-dep] ; sys_platform == 'win32'",
+]
 intelrealsense = [
     "pyrealsense2>=2.55.1.6486,<2.57.0 ; sys_platform != 'darwin'",
     "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",

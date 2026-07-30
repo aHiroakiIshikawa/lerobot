@@ -47,6 +47,7 @@ Notes:
 # Keep annotations eager in this module: parser.wrap() reads the raw cfg
 # annotation and requires the dataclass type rather than a postponed string.
 import logging
+import platform
 import time
 from dataclasses import dataclass, field
 
@@ -86,6 +87,23 @@ _EEF_X_MIN, _EEF_X_MAX = 0.02, 0.25
 _EEF_Y_MIN, _EEF_Y_MAX = -0.19, 0.17
 _EEF_Z_MIN, _EEF_Z_MAX = 0.00, 0.35
 _IK_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex")
+
+
+def make_handoff_kinematics(urdf_path: str):
+    """Select the native Placo backend or the pure-Python Windows backend."""
+    if platform.system() == "Windows":
+        from .ikpy_kinematics import IKPyRobotKinematics
+
+        return IKPyRobotKinematics(
+            urdf_path=urdf_path,
+            target_frame_name="wrist_link",
+            joint_names=list(_IK_JOINT_NAMES),
+        )
+    return RobotKinematics(
+        urdf_path=urdf_path,
+        target_frame_name="wrist_link",
+        joint_names=list(_IK_JOINT_NAMES),
+    )
 
 
 def limit_joint_step(
@@ -256,11 +274,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 f"{unknown_middle_keys}. Available keys: {sorted(available_position_keys)}"
             )
 
-        kinematics = RobotKinematics(
-            urdf_path=cfg.urdf_path,
-            target_frame_name="wrist_link",
-            joint_names=list(_IK_JOINT_NAMES),
-        )
+        kinematics = make_handoff_kinematics(cfg.urdf_path)
 
         # --- EEF pipeline (keyboard → joint actions) ---
         self._eef_pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](

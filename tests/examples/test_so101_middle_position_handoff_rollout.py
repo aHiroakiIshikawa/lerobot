@@ -162,17 +162,43 @@ def test_setup_uses_three_joint_wrist_kinematics() -> None:
 
     with (
         patch.object(strategy, "_init_engine"),
-        patch.object(handoff, "RobotKinematics") as kinematics,
+        patch.object(handoff, "make_handoff_kinematics") as make_kinematics,
     ):
         strategy.setup(_setup_context())
 
-    assert kinematics.call_args.kwargs == {
+    make_kinematics.assert_called_once_with("so101.urdf")
+    assert strategy._eef_pipeline.steps[1].motor_names == list(handoff._IK_JOINT_NAMES)
+    assert strategy._eef_pipeline.steps[-1].motor_names == list(MOTOR_NAMES)
+
+
+def test_make_handoff_kinematics_uses_ikpy_on_windows() -> None:
+    with (
+        patch.object(handoff.platform, "system", return_value="Windows"),
+        patch(
+            "examples.so101_middle_position_handoff.ikpy_kinematics.IKPyRobotKinematics"
+        ) as ikpy_kinematics,
+    ):
+        handoff.make_handoff_kinematics("so101.urdf")
+
+    assert ikpy_kinematics.call_args.kwargs == {
         "urdf_path": "so101.urdf",
         "target_frame_name": "wrist_link",
         "joint_names": list(handoff._IK_JOINT_NAMES),
     }
-    assert strategy._eef_pipeline.steps[1].motor_names == list(handoff._IK_JOINT_NAMES)
-    assert strategy._eef_pipeline.steps[-1].motor_names == list(MOTOR_NAMES)
+
+
+def test_make_handoff_kinematics_uses_placo_off_windows() -> None:
+    with (
+        patch.object(handoff.platform, "system", return_value="Linux"),
+        patch.object(handoff, "RobotKinematics") as placo_kinematics,
+    ):
+        handoff.make_handoff_kinematics("so101.urdf")
+
+    assert placo_kinematics.call_args.kwargs == {
+        "urdf_path": "so101.urdf",
+        "target_frame_name": "wrist_link",
+        "joint_names": list(handoff._IK_JOINT_NAMES),
+    }
 
 
 def test_limit_joint_step_clamps_without_mutating_input() -> None:
