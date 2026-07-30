@@ -53,6 +53,10 @@ class TestDwellDetectorConfig:
         with pytest.raises(ValueError, match="dwell_time_s"):
             DwellDetectorConfig(middle_positions={"j.pos": 0.0}, dwell_time_s=0.0)
 
+    def test_negative_entry_dropout_grace_raises(self):
+        with pytest.raises(ValueError, match="entry_dropout_grace_s"):
+            DwellDetectorConfig(middle_positions={"j.pos": 0.0}, entry_dropout_grace_s=-0.1)
+
     def test_valid_config(self):
         cfg = DwellDetectorConfig(
             middle_positions={"shoulder_pan.pos": 0.0},
@@ -64,7 +68,7 @@ class TestDwellDetectorConfig:
 
 
 class TestDwellDetector:
-    def _make(self, middle=None, entry=10.0, exit_=15.0, dwell=1.0):
+    def _make(self, middle=None, entry=10.0, exit_=15.0, dwell=1.0, dropout_grace=0.1):
         if middle is None:
             middle = {"j.pos": 0.0}
         clock = FakeClock()
@@ -73,6 +77,7 @@ class TestDwellDetector:
             entry_tolerance_deg=entry,
             exit_tolerance_deg=exit_,
             dwell_time_s=dwell,
+            entry_dropout_grace_s=dropout_grace,
         )
         det = DwellDetector(cfg, clock=clock)
         return det, clock
@@ -116,7 +121,33 @@ class TestDwellDetector:
         clock.advance(0.8)
         assert det.update(obs_in) is False  # timer restarted, only 0.8s elapsed
 
-    def test_rearming_requires_all_joints_to_exit(self):
+    def test_brief_entry_dropout_does_not_reset_timer(self):
+        det, clock = self._make(dwell=0.3, dropout_grace=0.1)
+        obs_in = {"j.pos": 5.0}
+        obs_out = {"j.pos": 11.0}
+
+        det.update(obs_in)
+        clock.advance(0.15)
+        det.update(obs_out)
+        clock.advance(0.05)
+        assert det.update(obs_in) is False
+        clock.advance(0.1)
+        assert det.update(obs_in) is True
+
+    def test_sustained_entry_dropout_resets_timer(self):
+        det, clock = self._make(dwell=0.3, dropout_grace=0.1)
+        obs_in = {"j.pos": 5.0}
+        obs_out = {"j.pos": 11.0}
+
+        det.update(obs_in)
+        clock.advance(0.15)
+        det.update(obs_out)
+        clock.advance(0.11)
+        det.update(obs_out)
+        clock.advance(0.15)
+        assert det.update(obs_in) is False
+
+    def test_rearming_requires_pose_to_exit(self):
         det, clock = self._make(dwell=1.0)
         obs_in = {"j.pos": 5.0}
         obs_out = {"j.pos": 50.0}  # outside exit_tol=15
@@ -138,6 +169,22 @@ class TestDwellDetector:
         det.update(obs_in)
         clock.advance(2.0)
         assert det.update(obs_in) is True  # fires again
+
+    def test_rearming_only_requires_one_joint_to_exit(self):
+        det, clock = self._make(
+            middle={"j1.pos": 0.0, "j2.pos": 90.0},
+            entry=10.0,
+            exit_=15.0,
+            dwell=0.2,
+        )
+        obs_in = {"j1.pos": 0.0, "j2.pos": 90.0}
+
+        det.update(obs_in)
+        clock.advance(0.2)
+        assert det.update(obs_in) is True
+
+        det.update({"j1.pos": 20.0, "j2.pos": 90.0})
+        assert det.is_armed is True
 
     def test_hysteresis_between_entry_and_exit(self):
         """Joints between entry_tol and exit_tol: disarmed state should NOT re-arm."""

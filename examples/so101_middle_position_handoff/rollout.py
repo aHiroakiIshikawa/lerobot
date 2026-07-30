@@ -299,6 +299,8 @@ class MiddlePositionHandoffConfig(RolloutConfig):
     entry_tolerance_deg: float = 10.0
     exit_tolerance_deg: float = 15.0
     dwell_time_s: float = 1.0
+    #: Ignore brief observation excursions outside the entry band.
+    entry_dropout_grace_s: float = 0.1
 
     # --- IK / EEF control ---
     urdf_path: str = "./SO101/so101_new_calib.urdf"
@@ -341,6 +343,7 @@ class MiddlePositionHandoffConfig(RolloutConfig):
             entry_tolerance_deg=self.entry_tolerance_deg,
             exit_tolerance_deg=self.exit_tolerance_deg,
             dwell_time_s=self.dwell_time_s,
+            entry_dropout_grace_s=self.entry_dropout_grace_s,
         )
         if self.eef_step_m <= 0:
             raise ValueError(f"eef_step_m must be positive, got {self.eef_step_m}")
@@ -392,6 +395,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         self._keyboard = keyboard_controller or KeyboardEEFController()
         self._motor_names: list[str] = []
         self._kinematics = None
+        self._last_dwell_status_log_at = float("-inf")
 
     # ------------------------------------------------------------------
     # RolloutStrategy interface
@@ -445,9 +449,24 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 entry_tolerance_deg=cfg.entry_tolerance_deg,
                 exit_tolerance_deg=cfg.exit_tolerance_deg,
                 dwell_time_s=cfg.dwell_time_s,
+                entry_dropout_grace_s=cfg.entry_dropout_grace_s,
             )
         )
 
+        logger.info(
+            "Handoff detector configured: joints=%s, entry=%.1f deg, exit=%.1f deg, "
+            "dwell=%.2f s, dropout_grace=%.2f s",
+            list(cfg.middle_positions),
+            cfg.entry_tolerance_deg,
+            cfg.exit_tolerance_deg,
+            cfg.dwell_time_s,
+            cfg.entry_dropout_grace_s,
+        )
+        if "gripper.pos" in cfg.middle_positions:
+            logger.warning(
+                "gripper.pos is included in middle_positions; gripper motion can prevent handoff. "
+                "Remove it unless gripper position is intentionally part of the trigger."
+            )
         logger.info("MiddlePositionHandoffStrategy ready")
 
     def run(self, ctx: RolloutContext) -> None:
@@ -483,7 +502,9 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 continue
 
             # --- Dwell check ---
-            if self._dwell.update(obs_raw):
+            handoff_requested = self._dwell.update(obs_raw)
+            self._log_dwell_status(obs_raw)
+            if handoff_requested:
                 logger.info("Dwell condition met — entering MANUAL EEF mode")
                 self._hold_mode(ctx)
 
@@ -524,6 +545,33 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _log_dwell_status(self, obs: dict[str, float]) -> None:
+        """Periodically report the joint that currently blocks the handoff."""
+        now = time.perf_counter()
+        if now - self._last_dwell_status_log_at < 2.0:
+            return
+        self._last_dwell_status_log_at = now
+
+        cfg = self._handoff_cfg
+        errors = {
+            key: abs(float(obs.get(key, float("inf"))) - target)
+            for key, target in cfg.middle_positions.items()
+        }
+        in_entry = sum(error <= cfg.entry_tolerance_deg for error in errors.values())
+        worst_key, worst_error = max(errors.items(), key=lambda item: item[1])
+        logger.info(
+            "Handoff status: armed=%s, in_entry=%d/%d, worst=%s error=%.2f deg "
+            "(limit=%.2f), dwell=%.2f/%.2f s",
+            self._dwell.is_armed,
+            in_entry,
+            len(errors),
+            worst_key,
+            worst_error,
+            cfg.entry_tolerance_deg,
+            self._dwell.dwell_elapsed_s,
+            cfg.dwell_time_s,
+        )
 
     def _hold_mode(self, ctx: RolloutContext) -> None:
         """Run the manual EEF control loop until Enter or ESC is pressed."""

@@ -42,6 +42,7 @@ def _settings(**overrides):
         "entry_tolerance_deg": 10.0,
         "exit_tolerance_deg": 15.0,
         "dwell_time_s": 1.0,
+        "entry_dropout_grace_s": 0.1,
         "urdf_path": "so101.urdf",
         "eef_step_m": 0.002,
         "max_ee_step_m": 0.03,
@@ -75,6 +76,7 @@ def test_cli_help_smoke() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "--middle_positions" in result.stdout
+    assert "--entry_dropout_grace_s" in result.stdout
     assert "--max_joint_step_deg" in result.stdout
 
 
