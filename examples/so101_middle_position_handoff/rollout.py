@@ -13,7 +13,7 @@ Autonomous policy execution with automatic handoff to keyboard EEF control:
 
 Usage::
 
-    python -m examples.so101_middle_position_handoff.rollout \\
+    uv run python -m examples.so101_middle_position_handoff.rollout \\
         --robot.type=so101_follower \\
         --robot.port=/dev/ttyACM0 \\
         --robot.id=my_follower \\
@@ -36,28 +36,28 @@ Keyboard controls (active only in MANUAL_EEF mode):
 Notes:
 - Only ``SyncInferenceConfig`` (``--inference.type=sync``) is supported.
   RTC requires additional queue/thread handling not implemented here.
-- Requires ``pynput`` (installed with ``lerobot[feetech]`` or separately via
-  ``pip install pynput``).  On macOS, grant *Accessibility* / *Input Monitoring*
+- Requires the ``hardware`` and ``kinematics`` extras (for example,
+    ``uv sync --extra hardware --extra feetech --extra kinematics --extra dataset``).
+    On macOS, grant *Accessibility* / *Input Monitoring*
   permission to the Python process.
 - ``middle_positions`` is required and has no default.
 - ``urdf_path`` must point to the SO-101 URDF for inverse kinematics.
 """
 
-from __future__ import annotations
-
+# Keep annotations eager in this module: parser.wrap() reads the raw cfg
+# annotation and requires the dataclass type rather than a postponed string.
 import logging
 import time
 from dataclasses import dataclass, field
-from threading import Event
 
-from lerobot.configs import PreTrainedConfig, parser
+from lerobot.configs import parser
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.processor import (
     RobotProcessorPipeline,
     robot_action_observation_to_transition,
     transition_to_robot_action,
 )
-from lerobot.robots.config import RobotConfig
+from lerobot.processor.delta_action_processor import MapDeltaActionToRobotActionStep
 from lerobot.robots.so_follower.robot_kinematic_processor import (
     EEBoundsAndSafety,
     EEReferenceAndDelta,
@@ -66,17 +66,15 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
 )
 from lerobot.rollout import RolloutConfig, build_rollout_context
 from lerobot.rollout.configs import BaseStrategyConfig
-from lerobot.rollout.inference import InferenceEngineConfig, RTCInferenceConfig, SyncInferenceConfig
-from lerobot.rollout.strategies.base import BaseStrategy
-from lerobot.rollout.strategies.core import RolloutStrategy, send_next_action
 from lerobot.rollout.context import RolloutContext
+from lerobot.rollout.inference import SyncInferenceConfig
+from lerobot.rollout.strategies.core import RolloutStrategy, send_next_action
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
-from lerobot.processor.delta_action_processor import MapDeltaActionToRobotActionStep
 
 from .dwell_detector import DwellDetector, DwellDetectorConfig
 from .keyboard_eef import KeyboardEEFController
@@ -87,6 +85,33 @@ logger = logging.getLogger(__name__)
 _EEF_X_MIN, _EEF_X_MAX = 0.02, 0.25
 _EEF_Y_MIN, _EEF_Y_MAX = -0.19, 0.17
 _EEF_Z_MIN, _EEF_Z_MAX = 0.00, 0.35
+_IK_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex")
+
+
+def limit_joint_step(
+    action: RobotAction,
+    observation: RobotObservation,
+    max_step_deg: float,
+) -> RobotAction:
+    """Clamp each joint target around its latest measured position."""
+    limited = action.copy()
+    clipped = []
+    for key, target in action.items():
+        if not key.endswith(".pos") or key not in observation:
+            continue
+        current = float(observation[key])
+        target = float(target)
+        delta = max(-max_step_deg, min(max_step_deg, target - current))
+        limited[key] = current + delta
+        if limited[key] != target:
+            clipped.append(key)
+    if clipped:
+        logger.warning(
+            "Clamped joint targets to %.1f deg/tick: %s",
+            max_step_deg,
+            ", ".join(clipped),
+        )
+    return limited
 
 
 # ---------------------------------------------------------------------------
@@ -95,33 +120,12 @@ _EEF_Z_MIN, _EEF_Z_MAX = 0.00, 0.35
 
 
 @dataclass
-class MiddlePositionHandoffConfig:
+class MiddlePositionHandoffConfig(RolloutConfig):
     """Configuration for the SO-101 middle-position keyboard EEF handoff rollout.
 
-    All standard ``RolloutConfig`` fields are replicated here so this config
-    can be used standalone as a ``@parser.wrap()`` entry point.
-
-    The ``policy`` field is populated automatically from ``--policy.path`` by
-    the draccus parser (via ``PreTrainedConfig``).
+    Inheriting :class:`RolloutConfig` preserves standard ``--policy.path``
+    loading, device resolution, and parser path-field handling.
     """
-
-    # --- Hardware ---
-    robot: RobotConfig | None = None
-
-    # --- Policy (loaded from --policy.path) ---
-    policy: PreTrainedConfig | None = None
-
-    # --- Inference backend ---
-    inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
-
-    # --- Runtime ---
-    fps: float = 30.0
-    duration: float = 0.0
-    task: str = ""
-    device: str | None = None
-    display_data: bool = False
-    rename_map: dict[str, str] = field(default_factory=dict)
-    return_to_initial_position: bool = True
 
     # --- Dwell detection ---
     #: Joint-name → target angle (degrees).  All listed joints must stay
@@ -138,6 +142,8 @@ class MiddlePositionHandoffConfig:
     eef_step_m: float = 0.002
     #: Maximum allowed EEF jump per tick (safety clamp, metres).
     max_ee_step_m: float = 0.03
+    #: Maximum commanded change for any joint in one control tick.
+    max_joint_step_deg: float = 15.0
     #: Gripper position change (degrees) per tick in discrete open/close mode.
     gripper_step_per_tick: float = 2.0
 
@@ -147,11 +153,40 @@ class MiddlePositionHandoffConfig:
     resume_blend_s: float = 0.5
 
     def __post_init__(self) -> None:
-        if isinstance(self.inference, RTCInferenceConfig):
+        if not isinstance(self.inference, SyncInferenceConfig):
             raise ValueError(
-                "MiddlePositionHandoffConfig: RTCInferenceConfig is not supported. "
+                "MiddlePositionHandoffConfig only supports SyncInferenceConfig. "
                 "Use SyncInferenceConfig (--inference.type=sync, the default)."
             )
+        if not isinstance(self.strategy, BaseStrategyConfig):
+            raise ValueError("Middle-position handoff requires --strategy.type=base")
+
+        DwellDetectorConfig(
+            middle_positions=self.middle_positions,
+            entry_tolerance_deg=self.entry_tolerance_deg,
+            exit_tolerance_deg=self.exit_tolerance_deg,
+            dwell_time_s=self.dwell_time_s,
+        )
+        if self.eef_step_m <= 0:
+            raise ValueError(f"eef_step_m must be positive, got {self.eef_step_m}")
+        if self.max_ee_step_m <= 0:
+            raise ValueError(f"max_ee_step_m must be positive, got {self.max_ee_step_m}")
+        if self.max_joint_step_deg <= 0:
+            raise ValueError(f"max_joint_step_deg must be positive, got {self.max_joint_step_deg}")
+        if self.gripper_step_per_tick <= 0:
+            raise ValueError(f"gripper_step_per_tick must be positive, got {self.gripper_step_per_tick}")
+        if self.resume_blend_s < 0:
+            raise ValueError(f"resume_blend_s must be non-negative, got {self.resume_blend_s}")
+        if self.robot is not None and hasattr(self.robot, "use_degrees") and not self.robot.use_degrees:
+            raise ValueError("Middle-position handoff requires --robot.use_degrees=true")
+        if (
+            self.robot is not None
+            and hasattr(self.robot, "max_relative_target")
+            and self.robot.max_relative_target is None
+        ):
+            self.robot.max_relative_target = self.max_joint_step_deg
+
+        super().__post_init__()
 
 
 # ---------------------------------------------------------------------------
@@ -167,13 +202,17 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
     as usual.
     """
 
-    def __init__(self, handoff_cfg: MiddlePositionHandoffConfig) -> None:
+    def __init__(
+        self,
+        handoff_cfg: MiddlePositionHandoffConfig,
+        keyboard_controller: KeyboardEEFController | None = None,
+    ) -> None:
         super().__init__(BaseStrategyConfig())
         self._handoff_cfg = handoff_cfg
 
         # Populated in setup()
         self._dwell: DwellDetector | None = None
-        self._keyboard: KeyboardEEFController | None = None
+        self._keyboard = keyboard_controller or KeyboardEEFController()
         self._eef_pipeline = None  # RobotProcessorPipeline
 
     # ------------------------------------------------------------------
@@ -182,6 +221,15 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
 
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise inference engine, kinematics, EEF pipeline, and I/O devices."""
+        if not self._keyboard.is_available:
+            self._keyboard.start()
+        if not self._keyboard.is_available:
+            raise RuntimeError(
+                "Keyboard EEF handoff requires a working pynput listener with key-release "
+                "capture. Use X11/macOS/Windows, install the hardware extra, and grant "
+                "desktop input permissions before starting the rollout."
+            )
+
         self._init_engine(ctx)
 
         cfg = self._handoff_cfg
@@ -196,23 +244,32 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         # Get motor names from the connected robot
         robot_inner = ctx.hardware.robot_wrapper.inner
         motor_names: list[str] = list(robot_inner.bus.motors.keys())
+        missing_ik_joints = [name for name in _IK_JOINT_NAMES if name not in motor_names]
+        if missing_ik_joints:
+            raise ValueError(f"Robot is missing required IK joints: {missing_ik_joints}")
+
+        available_position_keys = {f"{name}.pos" for name in motor_names}
+        unknown_middle_keys = sorted(set(cfg.middle_positions) - available_position_keys)
+        if unknown_middle_keys:
+            raise ValueError(
+                "middle_positions contains keys that are not robot joints: "
+                f"{unknown_middle_keys}. Available keys: {sorted(available_position_keys)}"
+            )
 
         kinematics = RobotKinematics(
             urdf_path=cfg.urdf_path,
             target_frame_name="wrist_link",
-            joint_names=motor_names,
+            joint_names=list(_IK_JOINT_NAMES),
         )
 
         # --- EEF pipeline (keyboard → joint actions) ---
-        self._eef_pipeline = RobotProcessorPipeline[
-            tuple[RobotAction, RobotObservation], RobotAction
-        ](
+        self._eef_pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
             steps=[
                 MapDeltaActionToRobotActionStep(position_scale=cfg.eef_step_m),
                 EEReferenceAndDelta(
                     kinematics=kinematics,
                     end_effector_step_sizes={"x": 1.0, "y": 1.0, "z": 1.0},
-                    motor_names=motor_names,
+                    motor_names=list(_IK_JOINT_NAMES),
                     use_latched_reference=False,
                 ),
                 EEBoundsAndSafety(
@@ -247,16 +304,6 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 dwell_time_s=cfg.dwell_time_s,
             )
         )
-
-        # --- Keyboard ---
-        self._keyboard = KeyboardEEFController()
-        self._keyboard.start()
-
-        if not self._keyboard.is_available:
-            logger.warning(
-                "pynput is unavailable. Manual EEF control will be disabled. "
-                "The rollout will continue in autonomous mode only."
-            )
 
         logger.info("MiddlePositionHandoffStrategy ready")
 
@@ -300,13 +347,9 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 if ctx.runtime.shutdown_event.is_set():
                     break
 
-                # Capture final manual position, then reset + blend
+                # Capture final manual position, then reset + blend.
                 final_obs = robot.get_observation()
-                engine.reset()
-                interpolator.reset()
-                self._cached_obs_processed = None
-
-                self._resume_with_blend(ctx, final_obs)
+                self._resume_autonomous(ctx, final_obs)
 
                 # Continue to top of loop (fresh obs for next autonomous tick)
                 continue
@@ -346,6 +389,8 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         keyboard = self._keyboard
         control_interval = 1.0 / cfg.fps
 
+        self._engine.pause()
+
         # Reset EEF pipeline state for a clean entry (no stale last-pos / IK guess)
         for step in self._eef_pipeline.steps:
             if hasattr(step, "reset"):
@@ -372,6 +417,9 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
                 ctx.runtime.shutdown_event.set()
                 break
 
+            if not keyboard.is_available:
+                raise RuntimeError("Keyboard listener stopped during manual EEF control")
+
             t0 = time.perf_counter()
 
             key_action = keyboard.read_action()
@@ -379,6 +427,11 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
 
             try:
                 joint_action = self._eef_pipeline((key_action, obs_raw))
+                joint_action = limit_joint_step(
+                    joint_action,
+                    obs_raw,
+                    cfg.max_joint_step_deg,
+                )
                 robot.send_action(joint_action)
             except Exception as exc:
                 logger.warning("EEF pipeline error (skipping frame): %s", exc)
@@ -386,6 +439,14 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
             dt = time.perf_counter() - t0
             if (sleep_t := control_interval - dt) > 0:
                 precise_sleep(sleep_t)
+
+    def _resume_autonomous(self, ctx: RolloutContext, final_obs: dict) -> None:
+        """Reset policy state and resume through a bounded joint-space blend."""
+        self._engine.reset()
+        self._interpolator.reset()
+        self._cached_obs_processed = None
+        self._engine.resume()
+        self._resume_with_blend(ctx, final_obs)
 
     def _resume_with_blend(
         self,
@@ -423,9 +484,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         # Prime the interpolator
         self._interpolator.add(action_tensor.cpu())
 
-        first_action: dict[str, float] = {
-            k: float(action_tensor[i]) for i, k in enumerate(ordered_keys)
-        }
+        first_action: dict[str, float] = {k: float(action_tensor[i]) for i, k in enumerate(ordered_keys)}
 
         # Latched manual end-positions (joint space).
         # Keys in final_obs are like "shoulder_pan.pos"; ordered_keys are the same
@@ -445,7 +504,12 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
             blended = {k: latched[k] * (1.0 - t) + first_action[k] * t for k in ordered_keys}
             obs_for_send = robot.get_observation()
             processed_action = ctx.processors.robot_action_processor((blended, obs_for_send))
-            robot.send_action(processed_action)
+            safe_action = limit_joint_step(
+                processed_action,
+                obs_for_send,
+                cfg.max_joint_step_deg,
+            )
+            robot.send_action(safe_action)
             precise_sleep(control_interval)
 
 
@@ -459,44 +523,26 @@ def main(cfg: MiddlePositionHandoffConfig) -> None:
     """CLI entry point for the SO-101 middle-position keyboard EEF handoff rollout."""
     init_logging()
 
-    if not cfg.middle_positions:
-        raise ValueError(
-            "Required: --middle_positions='{\"<joint>.pos\": <angle_deg>, ...}'\n"
-            "Example:  --middle_positions='{\"shoulder_pan.pos\": 0.0, "
-            "\"shoulder_lift.pos\": -30.0}'"
+    keyboard = KeyboardEEFController()
+    keyboard.start()
+    if not keyboard.is_available:
+        keyboard.stop()
+        raise RuntimeError(
+            "Keyboard EEF handoff cannot start because pynput key-release capture is unavailable."
         )
-
-    if isinstance(cfg.inference, RTCInferenceConfig):
-        raise ValueError(
-            "RTCInferenceConfig is not supported by this rollout. "
-            "Use --inference.type=sync (the default)."
-        )
-
-    # Build a standard RolloutConfig so build_rollout_context can be reused.
-    rollout_cfg = RolloutConfig(
-        robot=cfg.robot,
-        policy=cfg.policy,
-        strategy=BaseStrategyConfig(),
-        inference=cfg.inference,
-        fps=cfg.fps,
-        duration=cfg.duration,
-        task=cfg.task,
-        device=cfg.device,
-        display_data=cfg.display_data,
-        rename_map=cfg.rename_map,
-        return_to_initial_position=cfg.return_to_initial_position,
-    )
 
     signal_handler = ProcessSignalHandler(use_threads=True)
-
-    ctx = build_rollout_context(rollout_cfg, signal_handler.shutdown_event)
-
-    strategy = MiddlePositionHandoffStrategy(cfg)
+    strategy = MiddlePositionHandoffStrategy(cfg, keyboard_controller=keyboard)
+    ctx = None
     try:
+        ctx = build_rollout_context(cfg, signal_handler.shutdown_event)
         strategy.setup(ctx)
         strategy.run(ctx)
     finally:
-        strategy.teardown(ctx)
+        if ctx is not None:
+            strategy.teardown(ctx)
+        else:
+            keyboard.stop()
 
 
 if __name__ == "__main__":

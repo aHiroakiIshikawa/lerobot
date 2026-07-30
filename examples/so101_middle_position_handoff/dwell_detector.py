@@ -6,8 +6,8 @@ Hysteresis prevents re-triggering until all joints leave the exit-tolerance band
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 
 @dataclass

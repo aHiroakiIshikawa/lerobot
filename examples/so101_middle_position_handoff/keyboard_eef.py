@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+
+from lerobot.utils.keyboard_input import pynput_can_capture, pynput_listener_is_trusted
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,7 @@ try:
     keyboard = _kb
     _PYNPUT_AVAILABLE = True
 except Exception as _exc:
-    logger.warning(
-        "pynput not available; KeyboardEEFController will run in no-op mode: %s", _exc
-    )
+    logger.warning("pynput not available; KeyboardEEFController will run in no-op mode: %s", _exc)
 
 
 class KeyboardEEFController:
@@ -58,16 +57,16 @@ class KeyboardEEFController:
             # use action["delta_x"] etc.
         ctrl.stop()
 
-    If pynput is unavailable (headless / Wayland), the controller starts
-    in *no-op* mode: ``read_action()`` always returns zero deltas and
-    ``resume_requested`` / ``shutdown_requested`` remain unset.  Callers
-    should check :attr:`is_available` and warn the user.
+    If pynput cannot capture key-release events (headless, Wayland, or missing
+    desktop permissions), :attr:`is_available` remains ``False``. Callers must
+    fail closed instead of entering a manual-control loop that cannot be exited.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pressed: dict = {}  # key_obj → bool (True = pressed)
         self._listener = None
+        self._capture_available = False
 
         self.resume_requested: threading.Event = threading.Event()
         self.shutdown_requested: threading.Event = threading.Event()
@@ -78,8 +77,8 @@ class KeyboardEEFController:
 
     @property
     def is_available(self) -> bool:
-        """``True`` if pynput is importable and a listener can be started."""
-        return _PYNPUT_AVAILABLE
+        """``True`` while a trusted pynput listener is alive."""
+        return bool(self._capture_available and self._listener is not None and self._listener.is_alive())
 
     def start(self) -> None:
         """Start the background pynput listener.
@@ -87,19 +86,38 @@ class KeyboardEEFController:
         If pynput is unavailable, logs a warning and returns without error
         (no-op mode).
         """
-        if not _PYNPUT_AVAILABLE:
+        if self.is_available:
+            return
+        if not _PYNPUT_AVAILABLE or not pynput_can_capture():
             logger.warning(
-                "KeyboardEEFController: pynput is unavailable. "
-                "EEF keyboard control requires pynput on X11/macOS/Windows. "
-                "Running in no-op mode (no EEF movement will be produced)."
+                "KeyboardEEFController cannot capture key-release events. "
+                "EEF keyboard control requires pynput on X11/macOS/Windows "
+                "with the required desktop permissions."
             )
             return
 
-        self._listener = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
-        )
-        self._listener.start()
+        try:
+            self._listener = keyboard.Listener(
+                on_press=self._on_press,
+                on_release=self._on_release,
+            )
+            self._listener.start()
+            if not pynput_listener_is_trusted(self._listener):
+                logger.error(
+                    "pynput listener is not trusted. Grant Accessibility / Input Monitoring "
+                    "permission, then restart the rollout."
+                )
+                self._listener.stop()
+                self._listener = None
+                return
+        except Exception as exc:
+            logger.error("Could not start pynput keyboard listener: %s", exc)
+            if self._listener is not None:
+                self._listener.stop()
+                self._listener = None
+            return
+
+        self._capture_available = True
         logger.info(
             "KeyboardEEFController started. "
             "Arrows=EEF XY, Shift/Shift_R=Z, Ctrl_L/Ctrl_R=gripper, "
@@ -108,9 +126,12 @@ class KeyboardEEFController:
 
     def stop(self) -> None:
         """Stop the pynput listener."""
+        self._capture_available = False
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+        with self._lock:
+            self._pressed.clear()
 
     # ------------------------------------------------------------------
     # Action API
@@ -125,7 +146,7 @@ class KeyboardEEFController:
             ``delta_x``, ``delta_y``, ``delta_z`` : float in {-1, 0, +1}
             ``gripper`` : float in {0.0, 1.0, 2.0} (discrete: close/stay/open)
         """
-        if not _PYNPUT_AVAILABLE:
+        if not self.is_available:
             return {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}
 
         delta_x = 0.0
@@ -169,11 +190,7 @@ class KeyboardEEFController:
 
     def _on_press(self, key) -> None:
         # Normalise character keys so they compare equal to the Key enum
-        if hasattr(key, "char") and key.char is not None:
-            # ordinary printable character — store as-is (not used for motion)
-            normalised = key.char
-        else:
-            normalised = key
+        normalised = key.char if hasattr(key, "char") and key.char is not None else key
 
         if normalised == keyboard.Key.enter:
             self.resume_requested.set()
@@ -186,10 +203,7 @@ class KeyboardEEFController:
             self._pressed[normalised] = True
 
     def _on_release(self, key) -> None:
-        if hasattr(key, "char") and key.char is not None:
-            normalised = key.char
-        else:
-            normalised = key
+        normalised = key.char if hasattr(key, "char") and key.char is not None else key
 
         with self._lock:
             self._pressed[normalised] = False

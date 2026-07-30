@@ -8,19 +8,19 @@ Tests cover:
 from __future__ import annotations
 
 import threading
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# DwellDetector tests
-# ---------------------------------------------------------------------------
 
 from examples.so101_middle_position_handoff.dwell_detector import (
     DwellDetector,
     DwellDetectorConfig,
 )
+from examples.so101_middle_position_handoff.keyboard_eef import KeyboardEEFController
+
+# ---------------------------------------------------------------------------
+# DwellDetector tests
+# ---------------------------------------------------------------------------
 
 
 class FakeClock:
@@ -142,9 +142,9 @@ class TestDwellDetector:
     def test_hysteresis_between_entry_and_exit(self):
         """Joints between entry_tol and exit_tol: disarmed state should NOT re-arm."""
         det, clock = self._make(entry=10.0, exit_=20.0, dwell=1.0)
-        obs_in = {"j.pos": 5.0}       # inside entry (|5|=5 < 10)
-        obs_mid = {"j.pos": 15.0}     # outside entry (|15|=15 > 10) but inside exit (|15|=15 < 20)
-        obs_out = {"j.pos": 25.0}     # outside exit (|25|=25 > 20)
+        obs_in = {"j.pos": 5.0}  # inside entry (|5|=5 < 10)
+        obs_mid = {"j.pos": 15.0}  # outside entry but inside exit
+        obs_out = {"j.pos": 25.0}  # outside exit (|25|=25 > 20)
 
         # Fire once
         det.update(obs_in)
@@ -194,7 +194,6 @@ class TestDwellDetector:
     def test_force_arm(self):
         det, clock = self._make(dwell=1.0)
         obs_in = {"j.pos": 5.0}
-        obs_out = {"j.pos": 50.0}
 
         # Fire and disarm
         det.update(obs_in)
@@ -214,8 +213,6 @@ class TestDwellDetector:
 # ---------------------------------------------------------------------------
 # KeyboardEEFController tests (no hardware / no pynput required)
 # ---------------------------------------------------------------------------
-
-from examples.so101_middle_position_handoff.keyboard_eef import KeyboardEEFController
 
 
 class TestKeyboardEEFControllerNoPynput:
@@ -257,8 +254,48 @@ class TestKeyboardEEFControllerNoPynput:
 
     def test_start_stop_noop_no_error(self):
         ctrl = self._make_noop()
-        ctrl.start()   # should not raise
-        ctrl.stop()    # should not raise
+        ctrl.start()  # should not raise
+        ctrl.stop()  # should not raise
+
+
+class TestKeyboardEEFControllerLifecycle:
+    def test_start_marks_trusted_live_listener_available(self, monkeypatch):
+        import examples.so101_middle_position_handoff.keyboard_eef as mod
+
+        listener = MagicMock()
+        listener.is_alive.return_value = True
+        fake_keyboard = MagicMock()
+        fake_keyboard.Listener.return_value = listener
+        monkeypatch.setattr(mod, "keyboard", fake_keyboard)
+        monkeypatch.setattr(mod, "_PYNPUT_AVAILABLE", True)
+        monkeypatch.setattr(mod, "pynput_can_capture", lambda: True)
+        monkeypatch.setattr(mod, "pynput_listener_is_trusted", lambda _listener: True)
+
+        ctrl = KeyboardEEFController()
+        ctrl.start()
+
+        assert ctrl.is_available
+        listener.start.assert_called_once_with()
+        ctrl.stop()
+        listener.stop.assert_called_once_with()
+
+    def test_start_rejects_untrusted_listener(self, monkeypatch):
+        import examples.so101_middle_position_handoff.keyboard_eef as mod
+
+        listener = MagicMock()
+        listener.is_alive.return_value = True
+        fake_keyboard = MagicMock()
+        fake_keyboard.Listener.return_value = listener
+        monkeypatch.setattr(mod, "keyboard", fake_keyboard)
+        monkeypatch.setattr(mod, "_PYNPUT_AVAILABLE", True)
+        monkeypatch.setattr(mod, "pynput_can_capture", lambda: True)
+        monkeypatch.setattr(mod, "pynput_listener_is_trusted", lambda _listener: False)
+
+        ctrl = KeyboardEEFController()
+        ctrl.start()
+
+        assert not ctrl.is_available
+        listener.stop.assert_called_once_with()
 
 
 class TestKeyboardEEFControllerKeyState:
@@ -295,11 +332,9 @@ class TestKeyboardEEFControllerKeyState:
         mod._PYNPUT_AVAILABLE = True
 
         ctrl = KeyboardEEFController()
-        # Patch Listener to a no-op so we don't open real hardware
-        fk.Listener = MagicMock(
-            return_value=MagicMock(start=MagicMock(), stop=MagicMock())
-        )
-        ctrl.start()
+        ctrl._listener = MagicMock()
+        ctrl._listener.is_alive.return_value = True
+        ctrl._capture_available = True
 
         return ctrl, fk, mod, orig_kb, orig_avail
 
