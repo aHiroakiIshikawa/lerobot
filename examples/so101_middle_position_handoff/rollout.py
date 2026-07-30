@@ -24,8 +24,8 @@ Usage::
         --urdf_path=./SO101/so101_new_calib.urdf
 
 Keyboard controls (active only in MANUAL_EEF mode):
-    Left / Right arrow   → EEF X (±)
-    Up / Down arrow      → EEF Y (±)
+    Up / Down arrow      → EEF X (forward/backward)
+    Left / Right arrow   → EEF Y (left/right)
     Shift_R              → EEF Z +
     Left Shift           → EEF Z -
     Ctrl_R               → gripper open
@@ -51,23 +51,14 @@ import platform
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.model.kinematics import RobotKinematics
-from lerobot.processor import (
-    RobotProcessorPipeline,
-    robot_action_observation_to_transition,
-    transition_to_robot_action,
-)
-from lerobot.processor.delta_action_processor import MapDeltaActionToRobotActionStep
-from lerobot.robots.so_follower.robot_kinematic_processor import (
-    EEBoundsAndSafety,
-    EEReferenceAndDelta,
-    GripperVelocityToJoint,
-    InverseKinematicsEEToJoints,
-)
+from lerobot.robots.so_follower import SOFollowerConfig  # noqa: F401
 from lerobot.rollout import RolloutConfig, build_rollout_context
 from lerobot.rollout.configs import BaseStrategyConfig
 from lerobot.rollout.context import RolloutContext
@@ -91,6 +82,8 @@ _EEF_X_MIN, _EEF_X_MAX = 0.02, 0.25
 _EEF_Y_MIN, _EEF_Y_MAX = -0.19, 0.17
 _EEF_Z_MIN, _EEF_Z_MAX = 0.00, 0.35
 _IK_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex")
+_IK_JACOBIAN_EPS_DEG = 0.5
+_IK_DAMPING = 0.05
 
 
 def make_handoff_kinematics(urdf_path: str):
@@ -143,32 +136,146 @@ class ManualJointTargetLatch:
         self._motor_names = list(motor_names)
         self._targets = {f"{name}.pos": float(observation[f"{name}.pos"]) for name in self._motor_names}
 
-    @staticmethod
-    def input_is_active(key_action: RobotAction) -> bool:
-        return (
-            any(float(key_action.get(key, 0.0)) != 0.0 for key in ("delta_x", "delta_y", "delta_z"))
-            or float(key_action.get("gripper", 1.0)) != 1.0
-        )
-
     def hold_action(self) -> RobotAction:
         return self._targets.copy()
-
-    def merge_eef_action(self, eef_action: RobotAction, key_action: RobotAction) -> RobotAction:
-        merged = eef_action.copy()
-        gripper_active = float(key_action.get("gripper", 1.0)) != 1.0
-        for name in self._motor_names:
-            key = f"{name}.pos"
-            if name in _IK_JOINT_NAMES:
-                continue
-            if name == "gripper" and gripper_active:
-                continue
-            merged[key] = self._targets[key]
-        return merged
 
     def update(self, sent_action: RobotAction) -> None:
         for key in self._targets:
             if key in sent_action:
                 self._targets[key] = float(sent_action[key])
+
+
+def compute_position_jacobian(
+    kinematics,
+    joint_positions_deg: np.ndarray,
+    epsilon_deg: float = _IK_JACOBIAN_EPS_DEG,
+) -> np.ndarray:
+    """Compute the wrist-position Jacobian by finite differences."""
+    current = np.asarray(joint_positions_deg, dtype=float)
+    position = kinematics.forward_kinematics(current)[:3, 3]
+    jacobian = np.zeros((3, len(current)), dtype=float)
+    for index in range(len(current)):
+        perturbed = current.copy()
+        perturbed[index] += epsilon_deg
+        perturbed_position = kinematics.forward_kinematics(perturbed)[:3, 3]
+        jacobian[:, index] = (perturbed_position - position) / np.deg2rad(epsilon_deg)
+    return jacobian
+
+
+def damped_least_squares_ik_step(
+    kinematics,
+    current_joints_deg: np.ndarray,
+    target_position: np.ndarray,
+    max_joint_step_deg: float,
+    damping: float = _IK_DAMPING,
+) -> np.ndarray:
+    """Take one bounded DLS IK step from the measured joints toward the target."""
+    current = np.asarray(current_joints_deg, dtype=float)
+    current_position = kinematics.forward_kinematics(current)[:3, 3]
+    position_error = np.asarray(target_position, dtype=float) - current_position
+    jacobian = compute_position_jacobian(kinematics, current)
+    regularized = jacobian @ jacobian.T + damping**2 * np.eye(3)
+    delta_rad = jacobian.T @ np.linalg.solve(regularized, position_error)
+    delta_deg = np.rad2deg(delta_rad)
+    largest_step = float(np.max(np.abs(delta_deg)))
+    if largest_step > max_joint_step_deg:
+        delta_deg *= max_joint_step_deg / largest_step
+    result = current + delta_deg
+    if not np.all(np.isfinite(result)):
+        raise ValueError("DLS IK produced non-finite joint targets")
+    return result
+
+
+class ManualEEFController:
+    """Measured-state DLS controller used only while intervention is active."""
+
+    def __init__(
+        self,
+        kinematics,
+        motor_names: list[str],
+        observation: RobotObservation,
+        *,
+        eef_step_m: float,
+        max_ee_step_m: float,
+        max_target_lead_m: float,
+        max_joint_step_deg: float,
+        gripper_step_per_tick: float,
+    ) -> None:
+        self._kinematics = kinematics
+        self._joint_latch = ManualJointTargetLatch(motor_names, observation)
+        self._eef_step_m = eef_step_m
+        self._max_ee_step_m = max_ee_step_m
+        self._max_target_lead_m = max_target_lead_m
+        self._max_joint_step_deg = max_joint_step_deg
+        self._gripper_step_per_tick = gripper_step_per_tick
+        current_joints = self._ik_joints(observation)
+        self.target_position = kinematics.forward_kinematics(current_joints)[:3, 3].copy()
+
+    @staticmethod
+    def _workspace_clip(position: np.ndarray) -> np.ndarray:
+        return np.clip(
+            position,
+            [_EEF_X_MIN, _EEF_Y_MIN, _EEF_Z_MIN],
+            [_EEF_X_MAX, _EEF_Y_MAX, _EEF_Z_MAX],
+        )
+
+    @staticmethod
+    def _ik_joints(observation: RobotObservation) -> np.ndarray:
+        return np.asarray([float(observation[f"{name}.pos"]) for name in _IK_JOINT_NAMES])
+
+    def _update_position_target(self, key_action: RobotAction, actual_position: np.ndarray) -> None:
+        requested_delta = self._eef_step_m * np.asarray(
+            [key_action["delta_x"], key_action["delta_y"], key_action["delta_z"]],
+            dtype=float,
+        )
+        delta_norm = float(np.linalg.norm(requested_delta))
+        if delta_norm > self._max_ee_step_m:
+            requested_delta *= self._max_ee_step_m / delta_norm
+        self.target_position = self._workspace_clip(self.target_position + requested_delta)
+
+        lead = self.target_position - actual_position
+        lead_norm = float(np.linalg.norm(lead))
+        if lead_norm > self._max_target_lead_m:
+            self.target_position = actual_position + lead * (self._max_target_lead_m / lead_norm)
+
+    def action(self, key_action: RobotAction, observation: RobotObservation) -> RobotAction:
+        action = self._joint_latch.hold_action()
+        current_joints = self._ik_joints(observation)
+        actual_position = self._kinematics.forward_kinematics(current_joints)[:3, 3]
+
+        position_active = any(
+            float(key_action.get(key, 0.0)) != 0.0 for key in ("delta_x", "delta_y", "delta_z")
+        )
+        if position_active:
+            self._update_position_target(key_action, actual_position)
+            solved_joints = damped_least_squares_ik_step(
+                self._kinematics,
+                current_joints,
+                self.target_position,
+                self._max_joint_step_deg,
+            )
+            for index, name in enumerate(_IK_JOINT_NAMES):
+                action[f"{name}.pos"] = float(solved_joints[index])
+
+        gripper_command = float(key_action.get("gripper", 1.0))
+        if gripper_command != 1.0:
+            gripper_key = "gripper.pos"
+            direction = -1.0 if gripper_command > 1.0 else 1.0
+            action[gripper_key] = float(
+                np.clip(
+                    action[gripper_key] + direction * self._gripper_step_per_tick,
+                    0.0,
+                    100.0,
+                )
+            )
+
+        return limit_joint_step(action, observation, self._max_joint_step_deg)
+
+    def update(self, sent_action: RobotAction) -> None:
+        self._joint_latch.update(sent_action)
+
+    def hold_action(self) -> RobotAction:
+        return self._joint_latch.hold_action()
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +306,8 @@ class MiddlePositionHandoffConfig(RolloutConfig):
     eef_step_m: float = 0.002
     #: Maximum allowed EEF jump per tick (safety clamp, metres).
     max_ee_step_m: float = 0.03
+    #: Maximum distance the accumulated EEF target may lead the measured wrist.
+    max_ee_target_lead_m: float = 0.06
     #: Maximum joint change per tick during manual EEF control and resume blending.
     #: Autonomous policy actions use ``robot.max_relative_target`` instead.
     max_joint_step_deg: float = 15.0
@@ -237,6 +346,8 @@ class MiddlePositionHandoffConfig(RolloutConfig):
             raise ValueError(f"eef_step_m must be positive, got {self.eef_step_m}")
         if self.max_ee_step_m <= 0:
             raise ValueError(f"max_ee_step_m must be positive, got {self.max_ee_step_m}")
+        if self.max_ee_target_lead_m <= 0:
+            raise ValueError(f"max_ee_target_lead_m must be positive, got {self.max_ee_target_lead_m}")
         if self.max_joint_step_deg <= 0:
             raise ValueError(f"max_joint_step_deg must be positive, got {self.max_joint_step_deg}")
         if self.gripper_step_per_tick <= 0:
@@ -279,8 +390,8 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         # Populated in setup()
         self._dwell: DwellDetector | None = None
         self._keyboard = keyboard_controller or KeyboardEEFController()
-        self._eef_pipeline = None  # RobotProcessorPipeline
         self._motor_names: list[str] = []
+        self._kinematics = None
 
     # ------------------------------------------------------------------
     # RolloutStrategy interface
@@ -325,39 +436,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
             )
 
         kinematics = make_handoff_kinematics(cfg.urdf_path)
-
-        # --- EEF pipeline (keyboard → joint actions) ---
-        self._eef_pipeline = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-            steps=[
-                MapDeltaActionToRobotActionStep(position_scale=cfg.eef_step_m),
-                EEReferenceAndDelta(
-                    kinematics=kinematics,
-                    end_effector_step_sizes={"x": 1.0, "y": 1.0, "z": 1.0},
-                    motor_names=list(_IK_JOINT_NAMES),
-                    use_latched_reference=False,
-                ),
-                EEBoundsAndSafety(
-                    end_effector_bounds={
-                        "min": [_EEF_X_MIN, _EEF_Y_MIN, _EEF_Z_MIN],
-                        "max": [_EEF_X_MAX, _EEF_Y_MAX, _EEF_Z_MAX],
-                    },
-                    max_ee_step_m=cfg.max_ee_step_m,
-                    raise_on_jump=False,
-                ),
-                GripperVelocityToJoint(
-                    speed_factor=cfg.gripper_step_per_tick / 100.0,
-                    discrete_gripper=True,
-                ),
-                InverseKinematicsEEToJoints(
-                    kinematics=kinematics,
-                    motor_names=motor_names,
-                    orientation_weight=0.0,
-                    initial_guess_current_joints=True,
-                ),
-            ],
-            to_transition=robot_action_observation_to_transition,
-            to_output=transition_to_robot_action,
-        )
+        self._kinematics = kinematics
 
         # --- Dwell detector ---
         self._dwell = DwellDetector(
@@ -455,20 +534,25 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
 
         self._engine.pause()
 
-        # Reset EEF pipeline state for a clean entry (no stale last-pos / IK guess)
-        for step in self._eef_pipeline.steps:
-            if hasattr(step, "reset"):
-                step.reset()
-
         # Clear any stale resume_requested from a previous handoff
         keyboard.resume_requested.clear()
 
         entry_obs = robot.get_observation()
-        target_latch = ManualJointTargetLatch(self._motor_names, entry_obs)
+        manual_controller = ManualEEFController(
+            self._kinematics,
+            self._motor_names,
+            entry_obs,
+            eef_step_m=cfg.eef_step_m,
+            max_ee_step_m=cfg.max_ee_step_m,
+            max_target_lead_m=cfg.max_ee_target_lead_m,
+            max_joint_step_deg=cfg.max_joint_step_deg,
+            gripper_step_per_tick=cfg.gripper_step_per_tick,
+        )
 
         print(
             "\n[HANDOFF] *** MANUAL EEF MODE ***\n"
-            "  Arrow keys → EEF X/Y  |  Shift_R=Z+  Shift=Z-\n"
+            "  Up/Down → EEF forward/back | Left/Right → EEF left/right\n"
+            "  Shift_R=Z+  Shift=Z-\n"
             "  Ctrl_R=gripper open   |  Ctrl_L=gripper close\n"
             "  Enter → resume policy | ESC → stop\n"
         )
@@ -493,20 +577,12 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
             obs_raw = robot.get_observation()
 
             try:
-                if not target_latch.input_is_active(key_action):
-                    robot.send_action(target_latch.hold_action())
-                else:
-                    joint_action = self._eef_pipeline((key_action, obs_raw))
-                    joint_action = target_latch.merge_eef_action(joint_action, key_action)
-                    joint_action = limit_joint_step(
-                        joint_action,
-                        obs_raw,
-                        cfg.max_joint_step_deg,
-                    )
-                    sent_action = robot.send_action(joint_action)
-                    target_latch.update(sent_action if isinstance(sent_action, dict) else joint_action)
+                joint_action = manual_controller.action(key_action, obs_raw)
+                sent_action = robot.send_action(joint_action)
+                manual_controller.update(sent_action if isinstance(sent_action, dict) else joint_action)
             except Exception as exc:
-                logger.warning("EEF pipeline error (skipping frame): %s", exc)
+                logger.warning("EEF control error; holding previous target: %s", exc)
+                robot.send_action(manual_controller.hold_action())
 
             dt = time.perf_counter() - t0
             if (sleep_t := control_interval - dt) > 0:

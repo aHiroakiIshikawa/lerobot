@@ -9,6 +9,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 pytest.importorskip("datasets", reason="rollout requires the dataset extra")
@@ -25,6 +26,16 @@ MOTOR_NAMES = (
 )
 
 
+class LinearPositionKinematics:
+    """Test FK with one independent Cartesian axis per IK joint."""
+
+    @staticmethod
+    def forward_kinematics(joints_deg):
+        transform = np.eye(4)
+        transform[:3, 3] = np.deg2rad(np.asarray(joints_deg, dtype=float)[:3])
+        return transform
+
+
 def _settings(**overrides):
     values = {
         "middle_positions": {"shoulder_pan.pos": 0.0},
@@ -34,6 +45,7 @@ def _settings(**overrides):
         "urdf_path": "so101.urdf",
         "eef_step_m": 0.002,
         "max_ee_step_m": 0.03,
+        "max_ee_target_lead_m": 0.06,
         "max_joint_step_deg": 15.0,
         "gripper_step_per_tick": 2.0,
         "resume_blend_s": 0.5,
@@ -182,13 +194,15 @@ def test_setup_uses_three_joint_wrist_kinematics() -> None:
 
     with (
         patch.object(strategy, "_init_engine"),
-        patch.object(handoff, "make_handoff_kinematics") as make_kinematics,
+        patch.object(
+            handoff, "make_handoff_kinematics", return_value=LinearPositionKinematics()
+        ) as make_kinematics,
     ):
         strategy.setup(_setup_context())
 
     make_kinematics.assert_called_once_with("so101.urdf")
-    assert strategy._eef_pipeline.steps[1].motor_names == list(handoff._IK_JOINT_NAMES)
-    assert strategy._eef_pipeline.steps[-1].motor_names == list(MOTOR_NAMES)
+    assert isinstance(strategy._kinematics, LinearPositionKinematics)
+    assert strategy._motor_names == list(MOTOR_NAMES)
 
 
 def test_make_handoff_kinematics_uses_ikpy_on_windows() -> None:
@@ -245,51 +259,69 @@ def test_limit_joint_step_clamps_without_mutating_input() -> None:
     assert action["shoulder_pan.pos"] == 100.0
 
 
-def test_manual_joint_latch_holds_uncontrolled_joints_and_updates_active_targets() -> None:
+def test_manual_joint_latch_holds_and_updates_targets() -> None:
     observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
     latch = handoff.ManualJointTargetLatch(list(MOTOR_NAMES), observation)
 
-    assert not latch.input_is_active({"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0})
-    assert latch.input_is_active({"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0})
-
-    eef_action = {
-        "shoulder_pan.pos": 10.0,
-        "shoulder_lift.pos": 11.0,
-        "elbow_flex.pos": 12.0,
-        "wrist_flex.pos": -30.0,
-        "wrist_roll.pos": -40.0,
-        "gripper.pos": -50.0,
-    }
-    merged = latch.merge_eef_action(
-        eef_action,
-        {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0},
-    )
-
-    assert merged == {
-        "shoulder_pan.pos": 10.0,
-        "shoulder_lift.pos": 11.0,
-        "elbow_flex.pos": 12.0,
-        "wrist_flex.pos": 3.0,
-        "wrist_roll.pos": 4.0,
-        "gripper.pos": 5.0,
-    }
-
-    latch.update(merged)
-    assert latch.hold_action() == merged
+    assert latch.hold_action() == observation
+    latch.update({"shoulder_pan.pos": 10.0, "gripper.pos": 20.0})
+    assert latch.hold_action() == {**observation, "shoulder_pan.pos": 10.0, "gripper.pos": 20.0}
 
 
-def test_manual_joint_latch_allows_active_gripper_target() -> None:
+def test_manual_eef_controller_uses_dls_only_for_position_input() -> None:
     observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
-    latch = handoff.ManualJointTargetLatch(list(MOTOR_NAMES), observation)
-
-    merged = latch.merge_eef_action(
-        {f"{name}.pos": 20.0 + index for index, name in enumerate(MOTOR_NAMES)},
-        {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 2.0},
+    controller = handoff.ManualEEFController(
+        LinearPositionKinematics(),
+        list(MOTOR_NAMES),
+        observation,
+        eef_step_m=0.002,
+        max_ee_step_m=0.03,
+        max_target_lead_m=0.06,
+        max_joint_step_deg=5.0,
+        gripper_step_per_tick=2.0,
     )
 
-    assert merged["wrist_flex.pos"] == observation["wrist_flex.pos"]
-    assert merged["wrist_roll.pos"] == observation["wrist_roll.pos"]
-    assert merged["gripper.pos"] == 25.0
+    with patch.object(
+        handoff, "damped_least_squares_ik_step", wraps=handoff.damped_least_squares_ik_step
+    ) as dls:
+        idle = controller.action(
+            {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}, observation
+        )
+        assert idle == observation
+        dls.assert_not_called()
+
+        forward = controller.action(
+            {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}, observation
+        )
+        dls.assert_called_once()
+
+    assert forward["shoulder_pan.pos"] > observation["shoulder_pan.pos"]
+    assert forward["shoulder_lift.pos"] == pytest.approx(observation["shoulder_lift.pos"])
+    assert forward["elbow_flex.pos"] == pytest.approx(observation["elbow_flex.pos"])
+    assert forward["wrist_flex.pos"] == observation["wrist_flex.pos"]
+    assert forward["wrist_roll.pos"] == observation["wrist_roll.pos"]
+
+
+def test_manual_eef_controller_limits_target_lead_and_controls_gripper() -> None:
+    observation = {f"{name}.pos": 0.0 for name in MOTOR_NAMES}
+    controller = handoff.ManualEEFController(
+        LinearPositionKinematics(),
+        list(MOTOR_NAMES),
+        observation,
+        eef_step_m=0.02,
+        max_ee_step_m=0.03,
+        max_target_lead_m=0.025,
+        max_joint_step_deg=5.0,
+        gripper_step_per_tick=2.0,
+    )
+
+    for _ in range(10):
+        action = controller.action(
+            {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 0.0}, observation
+        )
+
+    assert np.linalg.norm(controller.target_position) <= 0.025 + 1e-9
+    assert action["gripper.pos"] == 2.0
 
 
 def test_manual_mode_pauses_engine_before_waiting_for_resume() -> None:
@@ -305,10 +337,14 @@ def test_manual_mode_pauses_engine_before_waiting_for_resume() -> None:
         keyboard_controller=keyboard,
     )
     strategy._engine = MagicMock()
-    strategy._eef_pipeline = SimpleNamespace(steps=[])
+    strategy._kinematics = LinearPositionKinematics()
+    strategy._motor_names = list(MOTOR_NAMES)
+    observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
+    robot = MagicMock()
+    robot.get_observation.return_value = observation
     ctx = SimpleNamespace(
         runtime=SimpleNamespace(shutdown_event=Event()),
-        hardware=SimpleNamespace(robot_wrapper=MagicMock()),
+        hardware=SimpleNamespace(robot_wrapper=robot),
     )
 
     strategy._hold_mode(ctx)
@@ -317,7 +353,7 @@ def test_manual_mode_pauses_engine_before_waiting_for_resume() -> None:
     assert resume_requested.clear.call_count == 2
 
 
-def test_manual_mode_runs_eef_pipeline_only_for_active_input() -> None:
+def test_manual_mode_routes_actions_through_manual_controller() -> None:
     idle_action = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}
     active_action = {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}
     resume_requested = MagicMock()
@@ -334,9 +370,7 @@ def test_manual_mode_runs_eef_pipeline_only_for_active_input() -> None:
     )
     strategy._engine = MagicMock()
     strategy._motor_names = list(MOTOR_NAMES)
-    strategy._eef_pipeline = MagicMock(
-        return_value={f"{name}.pos": 10.0 + index for index, name in enumerate(MOTOR_NAMES)}
-    )
+    strategy._kinematics = LinearPositionKinematics()
     observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
     robot = MagicMock()
     robot.get_observation.return_value = observation
@@ -349,12 +383,10 @@ def test_manual_mode_runs_eef_pipeline_only_for_active_input() -> None:
     with patch.object(handoff, "precise_sleep") as precise_sleep:
         strategy._hold_mode(ctx)
 
-    assert strategy._eef_pipeline.call_count == 1
-    assert strategy._eef_pipeline.call_args.args[0][0] == active_action
     assert robot.send_action.call_count == 2
     assert robot.send_action.call_args_list[0].args[0] == observation
+    assert robot.send_action.call_args_list[1].args[0]["shoulder_pan.pos"] > observation["shoulder_pan.pos"]
     assert robot.send_action.call_args_list[1].args[0]["wrist_flex.pos"] == observation["wrist_flex.pos"]
-    assert robot.send_action.call_args_list[1].args[0]["wrist_roll.pos"] == observation["wrist_roll.pos"]
     assert precise_sleep.call_count == 2
 
 

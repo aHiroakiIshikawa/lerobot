@@ -342,37 +342,37 @@ class TestKeyboardEEFControllerKeyState:
         mod.keyboard = orig_kb
         mod._PYNPUT_AVAILABLE = orig_avail
 
-    def test_left_key_press_sets_delta_x_positive(self):
+    def test_left_key_press_sets_delta_y_positive(self):
         ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
         try:
             ctrl._on_press(fk.Key.left)
             action = ctrl.read_action()
-            assert action["delta_x"] == 1.0
-            assert action["delta_y"] == 0.0
+            assert action["delta_x"] == 0.0
+            assert action["delta_y"] == 1.0
         finally:
             self._restore(mod, orig_kb, orig_avail)
 
-    def test_right_key_press_sets_delta_x_negative(self):
+    def test_right_key_press_sets_delta_y_negative(self):
         ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
         try:
             ctrl._on_press(fk.Key.right)
-            assert ctrl.read_action()["delta_x"] == -1.0
-        finally:
-            self._restore(mod, orig_kb, orig_avail)
-
-    def test_up_key_press_sets_delta_y_negative(self):
-        ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
-        try:
-            ctrl._on_press(fk.Key.up)
             assert ctrl.read_action()["delta_y"] == -1.0
         finally:
             self._restore(mod, orig_kb, orig_avail)
 
-    def test_down_key_press_sets_delta_y_positive(self):
+    def test_up_key_press_sets_delta_x_positive(self):
+        ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
+        try:
+            ctrl._on_press(fk.Key.up)
+            assert ctrl.read_action()["delta_x"] == 1.0
+        finally:
+            self._restore(mod, orig_kb, orig_avail)
+
+    def test_down_key_press_sets_delta_x_negative(self):
         ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
         try:
             ctrl._on_press(fk.Key.down)
-            assert ctrl.read_action()["delta_y"] == 1.0
+            assert ctrl.read_action()["delta_x"] == -1.0
         finally:
             self._restore(mod, orig_kb, orig_avail)
 
@@ -412,9 +412,9 @@ class TestKeyboardEEFControllerKeyState:
         ctrl, fk, mod, orig_kb, orig_avail = self._make_with_fake_keyboard()
         try:
             ctrl._on_press(fk.Key.left)
-            assert ctrl.read_action()["delta_x"] == 1.0
+            assert ctrl.read_action()["delta_y"] == 1.0
             ctrl._on_release(fk.Key.left)
-            assert ctrl.read_action()["delta_x"] == 0.0
+            assert ctrl.read_action()["delta_y"] == 0.0
         finally:
             self._restore(mod, orig_kb, orig_avail)
 

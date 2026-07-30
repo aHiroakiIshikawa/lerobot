@@ -5,9 +5,9 @@ key-press and key-release events needed for continuous hold-key motion,
 and so we can distinguish ``resume_requested`` (Enter) from normal
 movement keys without conflicting with any existing listeners.
 
-Key mapping (matches KeyboardEndEffectorTeleop defaults):
-    Left / Right arrow  → EEF X (±1)
-    Up / Down arrow     → EEF Y (±1)
+Key mapping (top-down robot base frame):
+    Up / Down arrow     → EEF X (forward/backward)
+    Left / Right arrow  → EEF Y (left/right)
     Shift_R             → EEF Z +1 (up)
     Shift (Left Shift)  → EEF Z -1 (down)
     Ctrl_R              → gripper open  (discrete action 2)
@@ -160,14 +160,14 @@ class KeyboardEEFController:
         for key, is_pressed in pressed.items():
             if not is_pressed:
                 continue
-            if key == keyboard.Key.left:
+            if key == keyboard.Key.up:
                 delta_x = 1.0
-            elif key == keyboard.Key.right:
-                delta_x = -1.0
-            elif key == keyboard.Key.up:
-                delta_y = -1.0
             elif key == keyboard.Key.down:
+                delta_x = -1.0
+            elif key == keyboard.Key.left:
                 delta_y = 1.0
+            elif key == keyboard.Key.right:
+                delta_y = -1.0
             elif key == keyboard.Key.shift_r:
                 delta_z = 1.0
             elif key == keyboard.Key.shift:
