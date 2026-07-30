@@ -207,9 +207,9 @@ pip install 'lerobot[feetech]'        # Feetech motor support
 
 _Multiple extras can be combined (e.g., `.[core_scripts,pi,pusht]`). For a full list of available extras, refer to `pyproject.toml`._
 
-### PyTorch CUDA variant (Linux only)
+### PyTorch CUDA variant (Linux and Windows)
 
-On Linux, the install path determines which CUDA wheel you get. macOS and Windows installs use the PyPI default (MPS / CPU / CUDA-Windows wheel respectively) and can skip this section.
+Source installs on Linux and Windows use the CUDA 12.8 PyTorch index by default. macOS uses the PyPI default with MPS support and can skip this section.
 
 <!-- prettier-ignore-start -->
 
@@ -218,7 +218,7 @@ On Linux, the install path determines which CUDA wheel you get. macOS and Window
 
 **Source install via `uv` (`uv sync` or `uv pip install -e .`)**
 
-`torch` and `torchvision` are pinned by the project to the **CUDA 12.8** PyTorch index (`https://download.pytorch.org/whl/cu128`, driver floor **570.86**) — covers Ampere/Ada/Hopper/Blackwell GPUs. No action needed for typical NVIDIA setups.
+On Linux and Windows, `torch` and `torchvision` are pinned by the project to the **CUDA 12.8** PyTorch index (`https://download.pytorch.org/whl/cu128`, driver floor **570.86**) — covers Ampere/Ada/Hopper/Blackwell GPUs. No action needed for typical NVIDIA setups.
 
 To override for a different CUDA variant:
 

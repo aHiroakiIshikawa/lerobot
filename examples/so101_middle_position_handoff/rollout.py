@@ -75,6 +75,7 @@ from lerobot.rollout.inference import SyncInferenceConfig
 from lerobot.rollout.strategies.core import RolloutStrategy, send_next_action
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import OBS_STR
+from lerobot.utils.device_utils import is_torch_device_available
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import precise_sleep
@@ -163,7 +164,8 @@ class MiddlePositionHandoffConfig(RolloutConfig):
     eef_step_m: float = 0.002
     #: Maximum allowed EEF jump per tick (safety clamp, metres).
     max_ee_step_m: float = 0.03
-    #: Maximum commanded change for any joint in one control tick.
+    #: Maximum joint change per tick during manual EEF control and resume blending.
+    #: Autonomous policy actions use ``robot.max_relative_target`` instead.
     max_joint_step_deg: float = 15.0
     #: Gripper position change (degrees) per tick in discrete open/close mode.
     gripper_step_per_tick: float = 2.0
@@ -174,6 +176,14 @@ class MiddlePositionHandoffConfig(RolloutConfig):
     resume_blend_s: float = 0.5
 
     def __post_init__(self) -> None:
+        if self.device is not None and not is_torch_device_available(self.device):
+            raise RuntimeError(
+                f"Requested --device={self.device}, but that accelerator is unavailable. "
+                "Refusing to run a real-robot Pi0.5 rollout on the automatic CPU fallback because "
+                "chunk inference stalls robot control. Check `nvidia-smi` and "
+                '`uv run python -c "import torch; print(torch.__version__, torch.version.cuda, '
+                'torch.cuda.is_available())"`, then install a CUDA-enabled PyTorch wheel.'
+            )
         if not isinstance(self.inference, SyncInferenceConfig):
             raise ValueError(
                 "MiddlePositionHandoffConfig only supports SyncInferenceConfig. "

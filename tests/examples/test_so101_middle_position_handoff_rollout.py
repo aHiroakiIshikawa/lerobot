@@ -66,6 +66,19 @@ def test_cli_help_smoke() -> None:
     assert "--max_joint_step_deg" in result.stdout
 
 
+def test_config_rejects_unavailable_requested_accelerator_before_policy_load() -> None:
+    cfg = SimpleNamespace(device="cuda")
+
+    with (
+        patch.object(handoff, "is_torch_device_available", return_value=False),
+        patch.object(handoff.RolloutConfig, "__post_init__") as parent_post_init,
+        pytest.raises(RuntimeError, match="Refusing to run.*CPU fallback"),
+    ):
+        handoff.MiddlePositionHandoffConfig.__post_init__(cfg)
+
+    parent_post_init.assert_not_called()
+
+
 def test_cli_policy_path_loads_before_hardware(monkeypatch) -> None:
     fake_policy = SimpleNamespace(device="cpu", pretrained_path=None)
     fake_context = object()
