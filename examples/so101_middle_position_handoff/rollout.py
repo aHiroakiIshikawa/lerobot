@@ -136,6 +136,41 @@ def limit_joint_step(
     return limited
 
 
+class ManualJointTargetLatch:
+    """Hold fixed joint targets while manual EEF input is idle."""
+
+    def __init__(self, motor_names: list[str], observation: RobotObservation) -> None:
+        self._motor_names = list(motor_names)
+        self._targets = {f"{name}.pos": float(observation[f"{name}.pos"]) for name in self._motor_names}
+
+    @staticmethod
+    def input_is_active(key_action: RobotAction) -> bool:
+        return (
+            any(float(key_action.get(key, 0.0)) != 0.0 for key in ("delta_x", "delta_y", "delta_z"))
+            or float(key_action.get("gripper", 1.0)) != 1.0
+        )
+
+    def hold_action(self) -> RobotAction:
+        return self._targets.copy()
+
+    def merge_eef_action(self, eef_action: RobotAction, key_action: RobotAction) -> RobotAction:
+        merged = eef_action.copy()
+        gripper_active = float(key_action.get("gripper", 1.0)) != 1.0
+        for name in self._motor_names:
+            key = f"{name}.pos"
+            if name in _IK_JOINT_NAMES:
+                continue
+            if name == "gripper" and gripper_active:
+                continue
+            merged[key] = self._targets[key]
+        return merged
+
+    def update(self, sent_action: RobotAction) -> None:
+        for key in self._targets:
+            if key in sent_action:
+                self._targets[key] = float(sent_action[key])
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -245,6 +280,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         self._dwell: DwellDetector | None = None
         self._keyboard = keyboard_controller or KeyboardEEFController()
         self._eef_pipeline = None  # RobotProcessorPipeline
+        self._motor_names: list[str] = []
 
     # ------------------------------------------------------------------
     # RolloutStrategy interface
@@ -275,6 +311,7 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         # Get motor names from the connected robot
         robot_inner = ctx.hardware.robot_wrapper.inner
         motor_names: list[str] = list(robot_inner.bus.motors.keys())
+        self._motor_names = motor_names
         missing_ik_joints = [name for name in _IK_JOINT_NAMES if name not in motor_names]
         if missing_ik_joints:
             raise ValueError(f"Robot is missing required IK joints: {missing_ik_joints}")
@@ -426,6 +463,9 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
         # Clear any stale resume_requested from a previous handoff
         keyboard.resume_requested.clear()
 
+        entry_obs = robot.get_observation()
+        target_latch = ManualJointTargetLatch(self._motor_names, entry_obs)
+
         print(
             "\n[HANDOFF] *** MANUAL EEF MODE ***\n"
             "  Arrow keys → EEF X/Y  |  Shift_R=Z+  Shift=Z-\n"
@@ -453,13 +493,18 @@ class MiddlePositionHandoffStrategy(RolloutStrategy):
             obs_raw = robot.get_observation()
 
             try:
-                joint_action = self._eef_pipeline((key_action, obs_raw))
-                joint_action = limit_joint_step(
-                    joint_action,
-                    obs_raw,
-                    cfg.max_joint_step_deg,
-                )
-                robot.send_action(joint_action)
+                if not target_latch.input_is_active(key_action):
+                    robot.send_action(target_latch.hold_action())
+                else:
+                    joint_action = self._eef_pipeline((key_action, obs_raw))
+                    joint_action = target_latch.merge_eef_action(joint_action, key_action)
+                    joint_action = limit_joint_step(
+                        joint_action,
+                        obs_raw,
+                        cfg.max_joint_step_deg,
+                    )
+                    sent_action = robot.send_action(joint_action)
+                    target_latch.update(sent_action if isinstance(sent_action, dict) else joint_action)
             except Exception as exc:
                 logger.warning("EEF pipeline error (skipping frame): %s", exc)
 

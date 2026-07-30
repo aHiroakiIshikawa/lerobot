@@ -245,6 +245,53 @@ def test_limit_joint_step_clamps_without_mutating_input() -> None:
     assert action["shoulder_pan.pos"] == 100.0
 
 
+def test_manual_joint_latch_holds_uncontrolled_joints_and_updates_active_targets() -> None:
+    observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
+    latch = handoff.ManualJointTargetLatch(list(MOTOR_NAMES), observation)
+
+    assert not latch.input_is_active({"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0})
+    assert latch.input_is_active({"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0})
+
+    eef_action = {
+        "shoulder_pan.pos": 10.0,
+        "shoulder_lift.pos": 11.0,
+        "elbow_flex.pos": 12.0,
+        "wrist_flex.pos": -30.0,
+        "wrist_roll.pos": -40.0,
+        "gripper.pos": -50.0,
+    }
+    merged = latch.merge_eef_action(
+        eef_action,
+        {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0},
+    )
+
+    assert merged == {
+        "shoulder_pan.pos": 10.0,
+        "shoulder_lift.pos": 11.0,
+        "elbow_flex.pos": 12.0,
+        "wrist_flex.pos": 3.0,
+        "wrist_roll.pos": 4.0,
+        "gripper.pos": 5.0,
+    }
+
+    latch.update(merged)
+    assert latch.hold_action() == merged
+
+
+def test_manual_joint_latch_allows_active_gripper_target() -> None:
+    observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
+    latch = handoff.ManualJointTargetLatch(list(MOTOR_NAMES), observation)
+
+    merged = latch.merge_eef_action(
+        {f"{name}.pos": 20.0 + index for index, name in enumerate(MOTOR_NAMES)},
+        {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 2.0},
+    )
+
+    assert merged["wrist_flex.pos"] == observation["wrist_flex.pos"]
+    assert merged["wrist_roll.pos"] == observation["wrist_roll.pos"]
+    assert merged["gripper.pos"] == 25.0
+
+
 def test_manual_mode_pauses_engine_before_waiting_for_resume() -> None:
     resume_requested = MagicMock()
     resume_requested.wait.return_value = True
@@ -268,6 +315,47 @@ def test_manual_mode_pauses_engine_before_waiting_for_resume() -> None:
 
     strategy._engine.pause.assert_called_once_with()
     assert resume_requested.clear.call_count == 2
+
+
+def test_manual_mode_runs_eef_pipeline_only_for_active_input() -> None:
+    idle_action = {"delta_x": 0.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}
+    active_action = {"delta_x": 1.0, "delta_y": 0.0, "delta_z": 0.0, "gripper": 1.0}
+    resume_requested = MagicMock()
+    resume_requested.wait.side_effect = [False, False, True]
+    keyboard = SimpleNamespace(
+        is_available=True,
+        resume_requested=resume_requested,
+        shutdown_requested=Event(),
+        read_action=MagicMock(side_effect=[idle_action, active_action]),
+    )
+    strategy = handoff.MiddlePositionHandoffStrategy(
+        _settings(),
+        keyboard_controller=keyboard,
+    )
+    strategy._engine = MagicMock()
+    strategy._motor_names = list(MOTOR_NAMES)
+    strategy._eef_pipeline = MagicMock(
+        return_value={f"{name}.pos": 10.0 + index for index, name in enumerate(MOTOR_NAMES)}
+    )
+    observation = {f"{name}.pos": float(index) for index, name in enumerate(MOTOR_NAMES)}
+    robot = MagicMock()
+    robot.get_observation.return_value = observation
+    robot.send_action.side_effect = lambda action: action
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(shutdown_event=Event()),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+    )
+
+    with patch.object(handoff, "precise_sleep") as precise_sleep:
+        strategy._hold_mode(ctx)
+
+    assert strategy._eef_pipeline.call_count == 1
+    assert strategy._eef_pipeline.call_args.args[0][0] == active_action
+    assert robot.send_action.call_count == 2
+    assert robot.send_action.call_args_list[0].args[0] == observation
+    assert robot.send_action.call_args_list[1].args[0]["wrist_flex.pos"] == observation["wrist_flex.pos"]
+    assert robot.send_action.call_args_list[1].args[0]["wrist_roll.pos"] == observation["wrist_roll.pos"]
+    assert precise_sleep.call_count == 2
 
 
 def test_resume_resets_then_resumes_before_blend() -> None:
