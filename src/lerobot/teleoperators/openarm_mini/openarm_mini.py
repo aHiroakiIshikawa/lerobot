@@ -41,6 +41,16 @@ SIDE_MOTORS_TO_FLIP: dict[str, list[str]] = {
 JOINT_REMAP = {"joint_6": "joint_7", "joint_7": "joint_6"}
 
 GRIPPER_TELEOP_TO_DEGREES = -0.65
+GRIPPER_MOTOR_ID = 8
+YAM_JOINT_NAMES = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "wrist_yaw",
+)
+YAM_JOINT_MOTOR_IDS = (1, 2, 4, 6, 7, 5)
 
 
 class OpenArmMini(Teleoperator):
@@ -58,19 +68,42 @@ class OpenArmMini(Teleoperator):
 
         if config.side is not None and config.side not in SIDE_MOTORS_TO_FLIP:
             raise ValueError(f"Invalid side '{config.side}'; expected 'left', 'right', or None.")
-        self._motors_to_flip: list[str] = SIDE_MOTORS_TO_FLIP.get(config.side, []) if config.side else []
 
-        norm_mode_body = MotorNormMode.DEGREES
-        motors = {
-            "joint_1": Motor(1, "sts3215", norm_mode_body),
-            "joint_2": Motor(2, "sts3215", norm_mode_body),
-            "joint_3": Motor(3, "sts3215", norm_mode_body),
-            "joint_4": Motor(4, "sts3215", norm_mode_body),
-            "joint_5": Motor(5, "sts3215", norm_mode_body),
-            "joint_6": Motor(6, "sts3215", norm_mode_body),
-            "joint_7": Motor(7, "sts3215", norm_mode_body),
-            "gripper": Motor(8, "sts3215", MotorNormMode.RANGE_0_100),
+        if config.yam_6dof:
+            logical_motor_names = YAM_JOINT_NAMES
+            active_joint_ids = YAM_JOINT_MOTOR_IDS
+            norm_mode_body = MotorNormMode.RANGE_M100_100
+        else:
+            logical_motor_names = tuple(f"joint_{motor_id}" for motor_id in range(1, 8))
+            active_joint_ids = tuple(range(1, 8))
+            norm_mode_body = MotorNormMode.DEGREES
+
+        physical_motor_names = {
+            logical_name: f"joint_{motor_id}"
+            for logical_name, motor_id in zip(logical_motor_names, active_joint_ids, strict=True)
         }
+        motors = {
+            logical_name: Motor(motor_id, "sts3215", norm_mode_body)
+            for logical_name, motor_id in zip(physical_motor_names, active_joint_ids, strict=True)
+        }
+        motors["gripper"] = Motor(GRIPPER_MOTOR_ID, "sts3215", MotorNormMode.RANGE_0_100)
+
+        physical_motors_to_flip = set(SIDE_MOTORS_TO_FLIP.get(config.side, []))
+        self._motors_to_flip = {
+            logical_name
+            for logical_name, physical_name in physical_motor_names.items()
+            if physical_name in physical_motors_to_flip
+        }
+        self._joint_remap = {} if config.yam_6dof else JOINT_REMAP
+
+        if self.calibration:
+            expected_calibration_ids = {name: motor.id for name, motor in motors.items()}
+            loaded_calibration_ids = {name: calibration.id for name, calibration in self.calibration.items()}
+            if loaded_calibration_ids != expected_calibration_ids:
+                raise ValueError(
+                    f"Calibration for teleoperator id '{self.id}' does not match "
+                    f"yam_6dof={config.yam_6dof}. Use a different --teleop.id and calibrate this layout."
+                )
 
         self.bus = FeetechMotorsBus(
             port=self.config.port,
@@ -152,6 +185,16 @@ class OpenArmMini(Teleoperator):
         if self.calibration is None:
             self.calibration = {}
 
+        range_mins: dict[str, int | float] = {}
+        range_maxes: dict[str, int | float] = {}
+        if self.config.yam_6dof:
+            body_motors = [motor for motor in self.bus.motors if motor != "gripper"]
+            print(
+                "Move all six arm joints through their full usable ranges. "
+                "Recording positions; press ENTER to stop..."
+            )
+            range_mins, range_maxes = self.bus.record_ranges_of_motion(body_motors)
+
         motor_resolution = self.bus.model_resolution_table[list(self.bus.motors.values())[0].model]
         max_res = motor_resolution - 1
 
@@ -182,6 +225,11 @@ class OpenArmMini(Teleoperator):
                     f"  {motor_name}: range set to [{range_min}, {range_max}] "
                     f"(0=closed, 100=open, drive_mode={drive_mode})"
                 )
+            elif self.config.yam_6dof:
+                range_min = int(range_mins[motor_name])
+                range_max = int(range_maxes[motor_name])
+                drive_mode = 0
+                logger.info(f"  {motor_name}: range set to [{range_min}, {range_max}]")
             else:
                 range_min = 0
                 range_max = max_res
@@ -223,10 +271,9 @@ class OpenArmMini(Teleoperator):
         # Per-side direction flip is applied based on the configured `side`.
         action: dict[str, Any] = {}
         for motor, val in positions.items():
-            target = JOINT_REMAP.get(motor, motor)
+            target = self._joint_remap.get(motor, motor)
             if motor == "gripper":
-                # Convert gripper from teleop 0-100 to openarms degrees: 0→0°, 100→-65°
-                action[f"{target}.pos"] = val * GRIPPER_TELEOP_TO_DEGREES
+                action[f"{target}.pos"] = val if self.config.yam_6dof else val * GRIPPER_TELEOP_TO_DEGREES
             else:
                 action[f"{target}.pos"] = -val if motor in self._motors_to_flip else val
 
@@ -247,11 +294,10 @@ class OpenArmMini(Teleoperator):
             if not key.endswith(".pos"):
                 continue
             base = key.removesuffix(".pos")
-            # JOINT_REMAP is symmetric (its own inverse).
-            target = JOINT_REMAP.get(base, base)
+            # The configured joint remap is symmetric (its own inverse).
+            target = self._joint_remap.get(base, base)
             if base == "gripper":
-                # Convert robot degrees to teleop 0-100: 0°→0, -65°→100
-                goals[target] = val / GRIPPER_TELEOP_TO_DEGREES
+                goals[target] = val if self.config.yam_6dof else val / GRIPPER_TELEOP_TO_DEGREES
             else:
                 # Un-flip using the ORIGINAL motor name (target = leader motor)
                 goals[target] = -val if target in self._motors_to_flip else val

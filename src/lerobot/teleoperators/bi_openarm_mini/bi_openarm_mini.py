@@ -50,6 +50,7 @@ class BiOpenArmMini(BimanualMixin, Teleoperator):
             calibration_dir=config.calibration_dir,
             port=config.left_arm_config.port,
             side="left",
+            yam_6dof=config.left_arm_config.yam_6dof,
             use_degrees=config.left_arm_config.use_degrees,
         )
 
@@ -58,6 +59,7 @@ class BiOpenArmMini(BimanualMixin, Teleoperator):
             calibration_dir=config.calibration_dir,
             port=config.right_arm_config.port,
             side="right",
+            yam_6dof=config.right_arm_config.yam_6dof,
             use_degrees=config.right_arm_config.use_degrees,
         )
 

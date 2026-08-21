@@ -30,6 +30,10 @@ class OpenArmMiniConfigBase:
     # during readout. If `None`, no flipping is applied.
     side: str | None = None
 
+    # Ignore physical motor ID 3 and expose the remaining joints using the YAM
+    # follower's names and normalized ranges.
+    yam_6dof: bool = False
+
     use_degrees: bool = True
 
 
