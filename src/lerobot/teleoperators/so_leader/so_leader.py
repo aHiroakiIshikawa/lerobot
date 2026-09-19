@@ -39,6 +39,20 @@ class SOLeader(Teleoperator):
     def __init__(self, config: SOLeaderTeleopConfig):
         super().__init__(config)
         self.config = config
+        expected_ids = {
+            "shoulder_pan": 1,
+            "shoulder_lift": 2,
+            "elbow_flex": 3,
+            "wrist_flex": 4,
+            **({"wrist_yaw": 5} if config.enable_wrist_yaw else {}),
+            "wrist_roll": 6 if config.enable_wrist_yaw else 5,
+            "gripper": 7 if config.enable_wrist_yaw else 6,
+        }
+        if self.calibration and {name: cal.id for name, cal in self.calibration.items()} != expected_ids:
+            raise ValueError(
+                "Calibration does not match the selected motor layout. "
+                "Use a new robot/teleop id and run lerobot-calibrate for this layout."
+            )
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
             port=self.config.port,
@@ -47,8 +61,9 @@ class SOLeader(Teleoperator):
                 "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
                 "elbow_flex": Motor(3, "sts3215", norm_mode_body),
                 "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+                **({"wrist_yaw": Motor(5, "sts3215", norm_mode_body)} if config.enable_wrist_yaw else {}),
+                "wrist_roll": Motor(6 if config.enable_wrist_yaw else 5, "sts3215", norm_mode_body),
+                "gripper": Motor(7 if config.enable_wrist_yaw else 6, "sts3215", MotorNormMode.RANGE_0_100),
             },
             calibration=self.calibration,
         )

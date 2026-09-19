@@ -28,6 +28,9 @@ class SOFollowerConfig:
     # Port to connect to the arm
     port: str
 
+    # Optional sixth arm joint: wrist_yaw ID 5, wrist_roll ID 6, gripper ID 7.
+    enable_wrist_yaw: bool = False
+
     disable_torque_on_disconnect: bool = True
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.

@@ -26,6 +26,9 @@ class SOLeaderConfig:
     # Port to connect to the arm
     port: str
 
+    # Optional sixth arm joint: wrist_yaw ID 5, wrist_roll ID 6, gripper ID 7.
+    enable_wrist_yaw: bool = False
+
     # Whether to use degrees for angles
     use_degrees: bool = True
 
